@@ -1,745 +1,1332 @@
-#include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
+#include <WiFi.h>
+#include <Arduino_GFX_Library.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h> 
+#include <Arduino_DriveBus_Library.h>
+#include <lvgl.h>
 #include <ModbusMaster.h>
-#include <ESP32Time.h>
+#include "pin_config.h"
 #include "time.h"
-#include <Arduino.h>
-#include <LittleFS.h>
-#include <HTTPClient.h>
+#include <ESP32Time.h>
+#include <freertos/semphr.h>
 #include <ArduinoJson.h>
-#include "esp_sleep.h"
 #include <Preferences.h>
+#include <Arduino.h>
+#include <HTTPClient.h>
+#include <LittleFS.h>
 
-#define PIN_SENSOR 19 
-#define FORMAT_LITTLEFS_IS_FAILED true
-volatile long countTouchChoiceDisplay = 1; // перерисовка текущего дисплея
-
-#define TX_PIN 17
-#define RX_PIN 16
-#define MY_PIN 4
-ModbusMaster node;
-volatile bool flag = false;
-hw_timer_t* timer = NULL;
-float humidity = 0;
-float temperature = 0;
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-AsyncWebServer server(80);
-IPAddress ip(192, 168, 2, 1);
-IPAddress getaway(192, 168, 2, 1);
-IPAddress subnet(255, 255, 255, 0);
-
-int day = 0;
-int month = 0;
-int year = 0;
-int seconds = 0;
-int minutes = 0;
-int hours = 0;
-ESP32Time rtc(3600);
-String get_date = "";
-String get_time = "";
-
-const char* url = "https://script.google.com/macros/s/AKfycbxpmCPxy1VAstwCHBI0Db6d4K8zlBAGs-gDfIue1bx3XUp6hGaRM7ioj6aELWTxw9i-/exec";
-const char* secretKey = "QWEr8793fdsa!!32LLqqp";
-WiFiClient client;
-
+HWCDC USBSerial;
 Preferences preferences;
+SemaphoreHandle_t sensor_mutex; // объект для синхронизации данных(т.к переменные temp и hum задействованы в разных потоках)  
+SemaphoreHandle_t time_mutex;
 
-#define PIN_ON_SENSOR 15 // on/off
-volatile bool systemEnabled = true; // текущее состояние
-bool lastSystemState = true; // предыдущее состояние
+// -> блок modbus
+  #define RX_PIN 16 
+  #define TX_PIN 17
+  #define TRANS_PIN 4
 
-volatile bool flagConnectWifi = false;
-hw_timer_t* timer_wifi_connect = NULL;
+  ModbusMaster node;
+  hw_timer_t* timer_modbus = NULL;
+  volatile bool modbus_flag = false;
 
-const char index_html[] PROGMEM = R"rawliteral(
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Дашборд датчика</title>
-  <style>
-    :root {
-      --bg:#0b1220;
-      --card:#0f1724;
-      --glass:rgba(255,255,255,0.05);
-      --accent-start:#22c1c3;
-      --accent-end:#4ee0a8;
-      --muted:#9aa6b2;
-      --good:#10b981;
-      --warn:#f59e0b;
-      --danger:#ef4444;
-      font-family: Inter, Roboto, "Segoe UI", system-ui, sans-serif;
+  volatile float humidity = 0;
+  volatile float temperature = 0;
+
+  TaskHandle_t task_modbus;
+
+  void IRAM_ATTR change_flag_modbus() {
+    modbus_flag = true;
+  }
+
+  void timer_modbus_start() {
+    timer_modbus = timerBegin(1000000);
+    timerAttachInterrupt(timer_modbus, &change_flag_modbus);
+    timerAlarm(timer_modbus, 2000000, true, 0);
+    timerStart(timer_modbus);
+  }
+
+  void preTransmission() {
+    digitalWrite(TRANS_PIN, HIGH);
+  }
+
+  void postTransmission() {
+    digitalWrite(TRANS_PIN, LOW);
+  }
+
+  void initial_modbus() {
+    Serial1.begin(4800, SERIAL_8N1, RX_PIN, TX_PIN);
+    node.begin(1, Serial1);
+    node.preTransmission(preTransmission);
+    node.postTransmission(postTransmission);
+  }
+
+  void modbus_task_function(void* parameter) {
+    initial_modbus();
+    timer_modbus_start();
+
+    for (;;) {
+      if (modbus_flag) {
+        modbus_flag = false;
+
+        uint8_t result;
+        uint16_t data_modbus[2];
+
+        result = node.readInputRegisters(0x0000, 2);
+        if (result == node.ku8MBSuccess) {
+          data_modbus[0] = node.getResponseBuffer(0x00);
+          data_modbus[1] = node.getResponseBuffer(0x01);
+
+          if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100))) { // -> пока данные не запишутся - нельзя их читать(1 задача - 100мс)
+            humidity = data_modbus[0] / 10.0;
+            temperature = data_modbus[1] / 10.0;
+            xSemaphoreGive(sensor_mutex);
+          }
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000)); // -> остановка текущей задачи(1с)
     }
-    body {
-      margin:0;
-      padding:0;
-      background:linear-gradient(180deg,#061025 0%, #071226 60%);
-      color:#e6eef3;
+  }
+
+// -> блок modbus
+
+// -> работа сервера
+  String ssid = "Torex";
+  String password = "Torex123";
+
+  IPAddress ip(192, 168, 2, 1);
+  IPAddress geteway(192, 168, 2, 1);
+  IPAddress subnet(255, 255, 255, 0);
+
+  AsyncWebServer server(80);
+
+  ESP32Time rtc(3600); // -> встроенный rtc-модуль esp32
+  volatile int day = 0;
+  volatile int month = 0;
+  volatile int year = 0;
+  volatile int hour = 0;
+  volatile int minutes = 0;
+  volatile int sec = 0;
+
+  TaskHandle_t task_server;
+
+  const char index_html[] PROGMEM = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <meta name="color-scheme" content="dark" />
+      <title>Дашборд датчика</title>
+
+      <style>
+      :root{
+        --bg0:#060f22;
+        --bg1:#071a33;
+        --glass:rgba(255,255,255,.06);
+        --stroke:rgba(255,255,255,.10);
+        --text:#e6eef3;
+        --muted:#9aa6b2;
+        --accent1:#22c1c3;
+        --accent2:#4ee0a8;
+        --shadow: 0 14px 40px rgba(0,0,0,.45);
+        --r: 18px;
+        --max: 720px;
+      }
+
+      *{ box-sizing:border-box; }
+      html,body{ height:100%; }
+
+      body{
+        margin:0;
+        color:var(--text);
+        font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+        background:
+        radial-gradient(1100px 700px at 15% 0%, rgba(34,193,195,.18), transparent 60%),
+        radial-gradient(900px 600px at 95% 20%, rgba(78,224,168,.14), transparent 55%),
+        linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 65%, #060f22 100%);
+        min-height:100vh;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        padding:16px;
+        position:relative;
+      }
+
+      /* Кнопка настроек в угол */
+      .settings-btn{
+        position: fixed;
+        top: 14px;
+        right: 14px;
+        z-index: 10;
+        width: 44px;
+        height: 44px;
+        border-radius: 14px;
+        border: 1px solid var(--stroke);
+        background: rgba(15,23,36,.55);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        color: var(--text);
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+        box-shadow: 0 10px 26px rgba(0,0,0,.35);
+        transition: transform .15s ease, opacity .15s ease;
+        -webkit-tap-highlight-color: transparent;
+        user-select:none;
+      }
+      .settings-btn:hover{ opacity:.95; transform: translateY(-1px); }
+      .settings-btn:active{ opacity:.9; transform: translateY(1px); }
+      .settings-btn svg{ width:20px; height:20px; opacity:.95; }
+
+      .wrap{
+        width:100%;
+        max-width:var(--max);
+        display:flex;
+        flex-direction:column;
+        gap:14px;
+      }
+
+      header{
+        padding:12px 8px 6px;
+        text-align:center;
+      }
+      
+      header h1{
+        margin:0;
+        font-size: clamp(18px, 3.8vw, 26px);
+        letter-spacing:.2px;
+      }
+      header p{
+        margin:6px 0 0;
+        color:var(--muted);
+        font-size: clamp(13px, 2.5vw, 15px);
+        line-height:1.35;
+      }
+
+      .card{
+        background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+        border: 1px solid var(--stroke);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: var(--r);
+        box-shadow: var(--shadow);
+        overflow:hidden;
+      }
+
+      .card-inner{
+        padding:16px;
+        display:flex;
+        flex-direction:column;
+        gap:14px;
+      }
+
+      .grid{
+        display:grid;
+        grid-template-columns: 1fr;
+        gap:12px;
+      }
+
+      @media (min-width: 520px){
+        .grid{ grid-template-columns: 1fr 1fr; }
+        .card-inner{ padding:18px; }
+      }
+
+      .metric{
+        padding:14px 14px 12px;
+        border-radius: 14px;
+        background: rgba(15,23,36,.72);
+        border: 1px solid rgba(255,255,255,.07);
+        position:relative;
+        overflow:hidden;
+      }
+
+      .metric::before{
+        content:"";
+        position:absolute;
+        inset:-2px;
+        background:
+        radial-gradient(420px 120px at 30% 0%, rgba(34,193,195,.22), transparent 60%),
+        radial-gradient(420px 120px at 80% 10%, rgba(78,224,168,.18), transparent 60%);
+        pointer-events:none;
+        opacity:.9;
+      }
+
+      .metric > *{ position:relative; z-index:1; }
+
+      .label{
+        color:var(--muted);
+        font-size: 13px;
+        display:flex;
+        align-items:center;
+        gap:8px;
+        letter-spacing:.2px;
+      }
+
+      .value{
+        margin-top:10px;
+        font-weight:800;
+        line-height:1;
+        font-size: clamp(34px, 7vw, 48px);
+        background: linear-gradient(90deg, var(--accent1), var(--accent2));
+        -webkit-background-clip:text;
+        background-clip:text;
+        color:transparent;
+        text-shadow: 0 0 24px rgba(78,224,168,.08);
+      }
+
+      .meta{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        padding:12px 14px;
+        border-radius:14px;
+        background: rgba(15,23,36,.55);
+        border: 1px solid rgba(255,255,255,.07);
+      }
+
+      .meta .left{
       display:flex;
       flex-direction:column;
-      align-items:center;
-      justify-content:flex-start;
-      min-height:100vh;
-    }
-    header {
+      gap:4px;
+      min-width: 0;
+      }
+
+      .meta .left .small{
+      color:var(--muted);
+      font-size:12px;
+      }
+
+      .meta .left .time{
+      font-size:14px;
+      font-weight:600;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width: 100%;
+      }
+
+      .btn{
       width:100%;
-      max-width:600px;
-      padding:20px;
-      text-align:center;
-    }
-    h1 { margin:0; font-size:20px; }
-    p { color:var(--muted); margin:4px 0 0; font-size:14px; }
-    .card {
-      background:var(--card);
-      border-radius:12px;
-      box-shadow:0 4px 20px rgba(0,0,0,0.4);
-      padding:20px;
-      margin:20px;
-      width:90%;
-      max-width:400px;
-      text-align:center;
-    }
-    .value {
-      font-size:40px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:10px;
+      padding:12px 14px;
+      border:none;
+      border-radius: 14px;
+      font-size:14px;
       font-weight:700;
-      margin:10px 0;
-      background:linear-gradient(90deg,var(--accent-start),var(--accent-end));
-      -webkit-background-clip:text;
-      -webkit-text-fill-color:transparent;
-    }
-    .label { color:var(--muted); font-size:13px; }
-    footer { color:var(--muted); font-size:13px; margin-bottom:20px; }
+      color:#062017;
+      cursor:pointer;
+      background: linear-gradient(90deg, var(--accent1), var(--accent2));
+      box-shadow: 0 14px 30px rgba(34,193,195,.18);
+      transition: transform .15s ease, opacity .15s ease;
+      user-select:none;
+      -webkit-tap-highlight-color: transparent;
+      }
 
-    /* Кнопка скачать */
-    .download-btn {
-      margin-top: 20px;
-      background: linear-gradient(90deg, var(--accent-start), var(--accent-end));
-      border: none;
-      border-radius: 8px;
-      padding: 10px 18px;
-      color: #fff;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      width: 100%;
-    }
-    .download-btn:hover { opacity: 0.9; transform: translateY(-1px); }
-    .download-btn:active { transform: translateY(1px); opacity: 0.8; }
+      .btn:hover{ opacity:.95; transform: translateY(-1px); }
+      .btn:active{ transform: translateY(1px); opacity:.9; }
 
-    /* ===== Добавлено: кнопка открытия формы Wi-Fi ===== */
-    .wifi-open-btn{
-      margin-top: 10px;
-      background: rgba(255,255,255,0.10);
-      border: 1px solid rgba(255,255,255,0.18);
-      border-radius: 8px;
-      padding: 10px 18px;
-      color: #fff;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      width: 100%;
-    }
-    .wifi-open-btn:hover { opacity: 0.95; }
-    .wifi-open-btn:active { opacity: 0.85; }
+      footer{
+      text-align:center;
+      color:var(--muted);
+      font-size:12.5px;
+        padding:6px 0 2px;
+      }
 
-    /* ===== Важно: твой // в CSS невалиден, поэтому делаем нормальное скрытие ===== */
-    .user-input { display:none; margin-top: 12px; text-align:left; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08); }
-    .user-input.open { display:block; }
+      @media (prefers-reduced-motion: reduce){
+        .btn, .settings-btn{ transition:none; }
+      }
 
-    /* Немного стиля полей */
-    .wifi-form input {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid rgba(255,255,255,0.15);
-      background: rgba(255,255,255,0.05);
-      color: #e6eef3;
-      outline: none;
-    }
-    .wifi-form input::placeholder { color: rgba(230,238,243,0.55); }
-    .wifi-form .user_field { margin: 10px 0; }
+      .dot{
+        width:10px; height:10px; border-radius:50%;
+        background:linear-gradient(90deg,var(--accent1),var(--accent2));
+        box-shadow: 0 0 18px rgba(78,224,168,.25);
+        flex:0 0 10px;
+      }
+      </style>
+    </head>
 
-    .wifi-status{
-      margin-top: 10px;
-      font-size: 13px;
-      min-height: 18px;
-      color: var(--muted);
-      text-align:left;
-    }
-    .wifi-status.ok{ color: var(--good); }
-    .wifi-status.err{ color: var(--danger); }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Дашборд датчика</h1>
-    <p>Температура и влажность в реальном времени</p>
-  </header>
+    <body>
+    <a class="settings-btn" href="/settings" aria-label="Настройки" title="Настройки">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="2"/>
+        <path d="M19.4 13a7.8 7.8 0 0 0 0-2l2-1.5-2-3.5-2.4 1a7.6 7.6 0 0 0-1.7-1L15 3h-6l-.3 2.5a7.6 7.6 0 0 0-1.7 1l-2.4-1-2 3.5 2 1.5a7.8 7.8 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7.6 7.6 0 0 0 1.7 1L9 21h6l.3-2.5a7.6 7.6 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5Z"
+            stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+      </svg>
+    </a>
 
-  <main class="card">
-    <div class="label">Температура</div>
-    <div class="value" id="temperature">--°C</div>
+    <div class="wrap">
+      <header>
+        <h1>Показания датчика</h1>
+        <p>Температура и влажность в реальном времени</p>
+      </header>
 
-    <div class="label">Влажность</div>
-    <div class="value" id="humidity">--%</div>
+      <section class="card" aria-label="Показания датчика">
+        <div class="card-inner">
+          <div class="grid">
+            <div class="metric" aria-label="Температура">
+              <div class="label"><span class="dot" aria-hidden="true"></span>Температура</div>
+              <div class="value" id="temperature">--°C</div>
+            </div>
 
-    <p class="label" id="updateTime">Обновление: --:--:--</p>
-    <p id="full-date"></p>
+            <div class="metric" aria-label="Влажность">
+              <div class="label"><span class="dot" aria-hidden="true"></span>Влажность</div>
+              <div class="value" id="humidity">--%</div>
+            </div>
+          </div>
 
-    <!-- Новая кнопка для скачивания файла -->
-    <button id="download-btn" class="download-btn" type="button">📥 Скачать файл</button>
+          <div class="meta" aria-label="Информация об обновлении">
+            <div class="left">
+              <div class="small">Обновление</div>
+              <div class="time" id="updateTime">--:--:--</div>
+              <div class="small" id="full-date">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
 
-    <!-- ===== Добавлено: кнопка, которая открывает окно ввода (ниже фрейма датчика) ===== -->
-    <button id="open-wifi" class="wifi-open-btn" type="button">📶 Подключить к Wi-Fi</button>
+      <button id="download-btn" class="btn" type="button">📥 Скачать данные</button>
 
-    <!-- Окно ввода Wi-Fi ниже фрейма датчика (как ты просил) -->
-    <div class="user-input" id="wifi-box">
-      <form class="wifi-form" id="wifi-form">
-        <p class="user_field">
-          <input id="ssid" name="ssid" type="text" placeholder="Введите название своей сети" required>
-        </p>
-        <p class="user_field">
-          <input id="pass" name="pass" type="password" placeholder="Введите пароль своей сети" required>
-        </p>
-        <button class="download-btn" type="submit">Отправить данные</button>
-        <div id="wifi-status" class="wifi-status"></div>
-      </form>
+      <footer>© Torex Monitoring</footer>
     </div>
-  </main>
 
-  <footer>
-    © Torex Monitoring
-  </footer>
+    <script> 
 
-  <script>
-    async function fetchData() {
-      try {
-        const [tResp, hResp] = await Promise.all([
-          fetch('/temp').catch(() => null),
-          fetch('/hum').catch(() => null)
-        ]);
-        if (!tResp || !hResp) throw new Error('нет связи');
-        const t = parseFloat(await tResp.text());
-        const h = parseFloat(await hResp.text());
-        updateDashboard(t, h);
-      } catch (e) {
-        document.getElementById('temperature').textContent = '--°C';
-        document.getElementById('humidity').textContent = '--%';
-        document.getElementById('updateTime').textContent = 'Ошибка связи';
+      function getDateHtml() { // -> получение даты и времени
+        let date = new Date();
+
+        let day = String(date.getDate()).padStart(2, "0");
+        let month = String(date.getMonth() + 1).padStart(2, "0");
+        let year = date.getFullYear();
+
+        let fullYear = day + "." + month + "." + year;
+
+        document
+          .getElementById('full-date')
+          .textContent = fullYear;
+
+        let hours = date.getHours();
+        let minutes = date.getMinutes();
+        let seconds = date.getSeconds();
+        let time = hours + ":" + minutes + ":" + seconds;
+
+        document
+          .getElementById('updateTime')
+          .textContent = time;
       }
-    }
 
-    function updateDashboard(temp, hum) {
-      document.getElementById('temperature').textContent = temp.toFixed(1) + '°C';
-      document.getElementById('humidity').textContent = hum.toFixed(1) + '%';
-      document.getElementById('updateTime').textContent =
-        'Обновление: ' + new Date().toLocaleTimeString('ru-RU');
-    }
-
-    async function requestServerDataOfDate() {
-      let date = new Date();
-      let dateDay = date.getDate();
-      let dateMonth = date.getMonth() + 1;
-      let dateYear = date.getFullYear();
-      let sec = date.getSeconds();
-      let min = date.getMinutes();
-      let hour = date.getHours();
-
-      try {
-        await fetch(
-          "/getDate?day=" + encodeURIComponent(dateDay) + "&" +
-          "month=" + encodeURIComponent(dateMonth) + "&" +
-          "year=" + encodeURIComponent(dateYear) + "&" +
-          "sec=" + encodeURIComponent(sec) + "&" +
-          "min=" + encodeURIComponent(min) + "&" +
-          "hour=" + encodeURIComponent(hour)
-        );
-      } catch (err) {
-        console.log(err);
-      }
-    }
-
-    function getFile() {
-      document.getElementById('download-btn').addEventListener('click', async () => {
+      async function getDataSensor() { // -> получение данных с сервера
         try {
-          const response = await fetch("/getFile");
+          
+          let responseTemp; // -> Ответ с url /temp
+          let responseHum; // -> Ответ с url /hum
 
-          if (!response.ok) {
-            console.log("Не удалось получить данные");
-            return;
+          responseTemp = await fetch('/temp');
+          responseHum = await fetch('/hum');
+
+          if (responseTemp.ok && responseHum.ok) {
+            document
+              .getElementById('temperature')
+              .textContent = await responseTemp.json();
+
+            document
+              .getElementById('humidity')
+              .textContent = await responseHum.json();
+          } else {
+            alert('Не удалось получить данные');
           }
 
-          const blob = await response.blob();
-          const url = window.URL.createObjectURL(blob);
-
-          const ref = document.createElement("a");
-          ref.href = url;
-          ref.download = "data_sensor.txt";
-
-          document.body.appendChild(ref);
-          ref.click();
-          document.body.removeChild(ref);
-
-          window.URL.revokeObjectURL(url);
-        } catch (err) {
-          console.log("Ошибка:", err);
+        } catch (error) {
+          console.error(error);
         }
-      });
-    }
-
-    function setupWifiToggle() {
-      const openBtn = document.getElementById('open-wifi');
-      const box = document.getElementById('wifi-box');
-      const ssidInput = document.getElementById('ssid');
-
-      openBtn.addEventListener('click', () => {
-        const isOpen = box.classList.toggle('open');
-        if (isOpen) ssidInput.focus();
-      });
-    }
-
-    function setupWifiSubmit() {
-      const form = document.getElementById('wifi-form');
-      const statusEl = document.getElementById('wifi-status');
-
-      function setStatus(text, kind) {
-        statusEl.textContent = text || '';
-        statusEl.classList.remove('ok', 'err');
-        if (kind) statusEl.classList.add(kind);
       }
 
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
+      setInterval(() => { // -> обновление экрана
+        getDateHtml();
+        getDataSensor();
+      }, 1000);
 
-        const ssid = document.getElementById('ssid').value.trim();
-        const pass = document.getElementById('pass').value;
+      // -> нужен скрипт для получения времени с устройства, которое подключается к esp32
+      async function sendDateOnServer() { // -> данная функция будет отправлять данные о времени на сервер
+        // -> формат времени должен быть таким: 
+        // dd-mm-YYYY -> дата
+        // HH-mm-ss -> время
 
-        if (!ssid || !pass) return;
+        let dateSend = new Date(); 
+        
+        let day = dateSend.getDate(); // -> возвращает день месяца
+        let month = dateSend.getMonth() + 1;
+        let year = dateSend.getFullYear();
+
+        let hour = dateSend.getHours();
+        let min = dateSend.getMinutes();
+        let sec = dateSend.getSeconds();
 
         try {
-          const url =
-          "/setWiFi?ssid=" + encodeURIComponent(ssid) +
-          "&pass=" + encodeURIComponent(pass);
+          await fetch("/getDate?day=" + encodeURIComponent(String(day).padStart(2, "0")) + "&" +
+            "month=" + encodeURIComponent(String(month).padStart(2, "0")) + "&" +
+            "year=" + encodeURIComponent(year) + "&" +
+            "hour=" + encodeURIComponent(hour) + "&" + 
+            "min=" + encodeURIComponent(min) + "&" +
+            "sec=" + encodeURIComponent(sec)
+          );
+        } catch(error) {
+          console.log(error);
+        }
+      }
+      sendDateOnServer();
 
-          const resp = await fetch(url);
-          const text = await resp.text();
+      function getDataFile() { // -> функция для получения файла с сервера
+        document
+          .getElementById("download-btn")
+          .addEventListener('click', async () => {
+            try {
+              const response = await fetch("/getFile");
 
-          console.log(text); // "ok" или "error"
-        } catch (err) {
-          console.log(err);
+              let blob = await response.blob();
+              let url = window.URL.createObjectURL(blob);
+
+              let ref = document.createElement("a");
+              ref.href = url;
+              ref.download = "data_sensor.txt";
+
+              document.body.appendChild(ref);
+              ref.click();
+              document.body.removeChild(ref);
+
+              window.URL.revokeObjectURL(url);
+            } catch (error) {
+              console.error(error);
+            }
+          });
+          getDataFile();
+      }
+
+    </script>
+    </body>
+    </html>
+  )rawliteral";
+
+  const char settings_html[] PROGMEM = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Настройки ESP32</title>
+
+    <style>
+      :root{
+      --bg0:#060f22; --bg1:#071a33; --stroke:rgba(255,255,255,.10);
+      --text:#e6eef3; --muted:#9aa6b2; --accent1:#22c1c3; --accent2:#4ee0a8;
+      --shadow: 0 14px 40px rgba(0,0,0,.45); --r: 18px; --max: 780px;
+    }
+
+      *{ box-sizing:border-box; margin:0; }
+
+      body{
+      color:var(--text);
+      font-family: system-ui, -apple-system, sans-serif;
+      background: radial-gradient(1100px 700px at 15% 0%, rgba(34,193,195,.18), transparent 60%),
+                  radial-gradient(900px 600px at 95% 20%, rgba(78,224,168,.14), transparent 55%),
+                  linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 65%, #060f22 100%);
+      min-height:100vh;
+      padding:16px;
+      }
+
+      .wrap{
+        max-width:var(--max); margin:0 auto;
+      }
+
+      header{
+        text-align:center; padding:12px 8px 6px;
+      }
+      h1{ font-size:clamp(18px, 3.8vw, 26px); margin:0; }
+      .subtitle{ color:var(--muted); font-size:clamp(13px, 2.5vw, 15px); margin-top:6px; }
+
+      .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border:1px solid var(--stroke); border-radius:var(--r);
+      backdrop-filter:blur(10px); box-shadow:var(--shadow); margin-top:14px;
+      }
+      .card-inner{ padding:16px; }
+      @media (min-width:420px){ .card-inner{ padding:18px; } }
+
+      .section{
+      padding:12px 14px; border-radius:14px;
+      background:rgba(15,23,36,.55); border:1px solid rgba(255,255,255,.07);
+      margin-bottom:14px;
+      }
+      .section-title{ font-weight:800; font-size:14px; }
+      .section-desc{ color:var(--muted); font-size:12px; margin-top:2px; }
+
+      .field{ margin-bottom:12px; }
+      label{ color:var(--muted); font-size:12px; display:block; margin-bottom:6px; }
+    
+      .input-group{ display:flex; gap:10px; }
+      .input, select{
+        width:100%; padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,.10);
+        background:rgba(6,15,34,.55); color:var(--text); font-size:14px;
+      }
+      .input:focus, select:focus{
+      border-color:rgba(78,224,168,.35); box-shadow:0 0 0 3px rgba(78,224,168,.12);
+      outline:none;
+      }
+    
+      .unit{
+      color:var(--muted); font-size:12px; white-space:nowrap;
+      padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,.10);
+      background:rgba(6,15,34,.35);
+      }
+
+      .option{
+      padding:14px; border-radius:14px; background:rgba(15,23,36,.72);
+      border:1px solid rgba(255,255,255,.07); margin-bottom:12px;
+      }
+      .option-header{
+      display:flex; align-items:flex-start; gap:10px; cursor:pointer;
+      }
+      .option-title{ font-weight:800; font-size:14px; }
+      .option-desc{ color:var(--muted); font-size:12px; margin-top:4px; }
+    
+      .panel{
+      margin-top:10px; padding:12px; border-radius:14px;
+      background:rgba(255,255,255,.03); border:1px dashed rgba(255,255,255,.12);
+      }
+      .hidden{ display:none; }
+
+      .grid{ display:grid; gap:10px; }
+      @media (min-width:720px){ .grid{ grid-template-columns:1fr 1fr; } }
+
+      .actions{
+      display:flex; flex-direction:column; gap:10px; margin-top:20px;
+      }
+      @media (min-width:520px){ .actions{ flex-direction:row; } }
+    
+      .btn{
+      padding:12px 14px; border-radius:14px; border:none; font-size:14px;
+      font-weight:800; cursor:pointer; flex:1; text-align:center;
+      text-decoration:none; display:inline-block;
+      }
+      .btn-primary{
+      background:linear-gradient(90deg, var(--accent1), var(--accent2));
+      color:#062017; box-shadow:0 14px 30px rgba(34,193,195,.18);
+      }
+      .btn-secondary{
+      background:rgba(15,23,36,.55); color:var(--text);
+      border:1px solid rgba(255,255,255,.12);
+      }
+
+      .hint{ color:rgba(154,166,178,.85); font-size:12px; margin-top:6px; }
+    </style>
+    </head>
+
+    <body>
+    <div class="wrap">
+    <header>
+      <h1>Настройки ESP32</h1>
+      <p class="subtitle">Частота опроса и сохранение данных</p>
+    </header>
+
+    <section class="card">
+      <form class="card-inner" action="/" method="GET">
+
+        <div class="section">
+          <div class="section-title">Частота получения данных</div>
+          <div class="section-desc">Интервал чтения датчика (в секундах).</div>
+        </div>
+
+        <div class="field">
+          <label for="poll_s">Интервал опроса</label>
+          <div class="input-group">
+            <select class="input" id="poll_s" name="poll_s">
+              <option value="2" selected>2</option><option value="5">5</option>
+              <option value="10">10</option><option value="15">15</option>
+              <option value="30">30</option>
+            </select>
+            <span class="unit">сек</span>
+          </div>
+          <div class="hint">Минимальный интервал записи для всех способов сохранения.</div>
+        </div>
+
+        <div class="section">
+          <div class="section-title">Сохранение данных</div>
+          <div class="section-desc">Выбери один или несколько способов</div>
+        </div>
+
+        <!-- Google Sheets -->
+        <div class="option">
+          <div class="option-header" onclick="document.getElementById('use_gs').click()">
+            <input type="checkbox" id="use_gs" name="use_gs" style="margin-top:2px;">
+            <div>
+              <div class="option-title">Google Таблицы</div>
+              <div class="option-desc">Отправка данных в Google Sheets</div>
+            </div>
+          </div>
+          
+          <div id="panel_gs" class="panel hidden">
+            <div class="grid">
+              <div><label for="wifi_ssid">Wi-Fi SSID</label>
+                <input class="input" id="wifi_ssid" name="wifi_ssid" placeholder="Имя сети"></div>
+              <div><label for="wifi_pass">Wi-Fi пароль</label>
+                <input class="input" id="wifi_pass" name="wifi_pass" placeholder="Пароль" type="password"></div>
+            </div>
+            
+            <div class="grid">
+              <div><label for="gs_url">URL Google Sheets</label>
+                <input class="input" id="gs_url" name="gs_url" placeholder="https://script.google.com/..."></div>
+              <div><label for="gs_key">Секретный ключ</label>
+                <input class="input" id="gs_key" name="gs_key" placeholder="Ваш ключ"></div>
+            </div>
+            
+            <div style="margin-top:10px;">
+              <label for="gs_period_s">Скорость отправки</label>
+              <div class="input-group">
+                <select class="input save-period" id="gs_period_s" name="gs_period_s">
+                  <option value="2">2</option><option value="5" selected>5</option>
+                  <option value="10">10</option><option value="15">15</option>
+                  <option value="30">30</option>
+                </select>
+                <span class="unit">сек</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Excel -->
+        <div class="option">
+          <div class="option-header" onclick="document.getElementById('use_excel').click()">
+            <input type="checkbox" id="use_excel" name="use_excel" style="margin-top:2px;">
+            <div>
+              <div class="option-title">Excel (Data Streamer)</div>
+              <div class="option-desc">Передача данных в Excel</div>
+            </div>
+          </div>
+          
+          <div id="panel_excel" class="panel hidden">
+            <label for="excel_period_s">Скорость передачи</label>
+            <div class="input-group">
+              <select class="input save-period" id="excel_period_s" name="excel_period_s">
+                <option value="2" selected>2</option><option value="5">5</option>
+                <option value="10">10</option><option value="15">15</option>
+                <option value="30">30</option>
+              </select>
+              <span class="unit">сек</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Файловая система -->
+        <div class="option">
+          <div class="option-header" onclick="document.getElementById('use_fs').click()">
+            <input type="checkbox" id="use_fs" name="use_fs" style="margin-top:2px;">
+            <div>
+              <div class="option-title">Файловая система ESP32</div>
+              <div class="option-desc">Локальное логирование</div>
+            </div>
+          </div>
+          
+          <div id="panel_fs" class="panel hidden">
+            <div style="margin-bottom:10px;">
+              <label for="fs_period_s">Скорость логирования</label>
+              <div class="input-group">
+                <select class="input save-period" id="fs_period_s" name="fs_period_s">
+                  <option value="2" selected>2</option><option value="5">5</option>
+                  <option value="10">10</option><option value="15">15</option>
+                  <option value="30">30</option>
+                </select>
+                <span class="unit">сек</span>
+              </div>
+            </div>
+            
+            <div class="grid">
+              <div><label for="fs_filename">Имя файла</label>
+                <input class="input" id="fs_filename" name="fs_filename" value="log.txt"></div>
+              <div><label for="fs_format">Формат</label>
+                <input class="input" id="fs_format" name="fs_format" value="txt"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" type="button" id="send-server">✅ Применить</button>
+          <a class="btn btn-secondary" href="/">← Назад к показаниям</a>
+        </div>
+
+        <div class="hint" style="margin-top:14px;">
+          Сейчас форма отправляет параметры через URL (GET). Для пароля/ключа лучше сделать POST.
+        </div>
+      </form>
+    </section>
+    </div>
+
+    <script>
+
+      function sendSettingsOnServer() { // -> привязка к кнопке и отправка на сервер настроек
+        document
+          .getElementById("send-server")
+          .addEventListener('click', async () => {
+            try {
+              let valueInterval = document.getElementById('poll_s').value; // -> первый input - интервал чтения modbus
+              let valueCheckBoxGoogle = document.getElementById('use_gs').checked;
+              let valueCheckBoxExcel = document.getElementById('use_excel').checked;
+              let valueCheckBoxFileSystem = document.getElementById('use_fs').checked;
+
+              let valueSsidWifi = document.getElementById('wifi_ssid').value;
+              let valuePasswordWifi = document.getElementById('wifi_pass').value;
+              let valueUrl = document.getElementById('gs_url').value;
+              let valueSecretKey = document.getElementById('gs_key').value;
+              let valueWriteInGoogle = document.getElementById('gs_period_s').value;
+
+              let valueWriteInExcel = document.getElementById('excel_period_s').value;
+
+              let valueWriteFs = document.getElementById('fs_period_s').value;
+              let valueFileName = document.getElementById('fs_filename').value;
+
+              await fetch('/get_settings', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  "interval": valueInterval,
+                  "google": {
+                    "flag-google": valueCheckBoxGoogle,
+                    "wifi-ssid": valueSsidWifi,
+                    "wifi-pass": valuePasswordWifi,
+                    "url-gs": valueUrl,
+                    "secret-key": valueSecretKey,
+                    "interval-write": valueWriteInGoogle
+                  },
+                  "excel": {
+                    "flag-excel": valueCheckBoxExcel,
+                    "interval-write": valueWriteInExcel
+                  },
+                  "file-system": {
+                    "flag-fs": valueCheckBoxFileSystem,
+                    "interval-write": valueWriteFs,
+                    "file-name": valueFileName
+                  }
+                })
+              });
+            } catch(error) {
+              console.error(error);
+            }
+          });
+      }
+
+      sendSettingsOnServer();
+
+      document.addEventListener('DOMContentLoaded', function() {
+        // Показ/скрытие панелей настроек
+        ['gs', 'excel', 'fs'].forEach(id => {
+          const chk = document.getElementById('use_' + id);
+          const panel = document.getElementById('panel_' + id);
+          if (chk && panel) {
+            chk.addEventListener('change', () => panel.classList.toggle('hidden', !chk.checked));
+          }
+        });
+
+        // Валидация периодов сохранения
+        const pollSelect = document.getElementById('poll_s');
+        const saveSelects = document.querySelectorAll('.save-period');
+      
+        function updateSavePeriods() {
+          const min = parseInt(pollSelect.value);
+        
+          saveSelects.forEach(select => {
+            Array.from(select.options).forEach(option => {
+              option.disabled = parseInt(option.value) < min;
+            });
+          
+            // Автоматический выбор допустимого значения
+            if (parseInt(select.value) < min) {
+              const validOptions = Array.from(select.options).filter(opt => !opt.disabled);
+              if (validOptions.length > 0) {
+                select.value = validOptions[0].value;
+              }
+            }
+          });
+        }
+      
+        if (pollSelect) {
+          pollSelect.addEventListener('change', updateSavePeriods);
+          updateSavePeriods();
         }
       });
-    }
+    </script>
+    </body>
+    </html>
+  )rawliteral";
 
-    getFile();
-    setupWifiToggle();
-    setupWifiSubmit();
-    requestServerDataOfDate();
-    fetchData();
-    setInterval(fetchData, 2000);
-  </script>
-</body>
-</html>
-)rawliteral";
+  void start_server() {
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+      request -> send_P(200, "text/html", index_html);
+    });
 
-void IRAM_ATTR onWork() {
-  systemEnabled = !systemEnabled;
-}
+    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+      request -> send_P(200, "text/html", settings_html);
+    });
 
-// void startWiFiAp(String ssid, String password) {
-//   WiFi.mode(WIFI_AP_STA);
-//   WiFi.softAP(ssid, password);
-//   WiFi.softAPConfig(ip, getaway, subnet);
-// }
+    server.on("/temp", HTTP_GET, [](AsyncWebServerRequest* request) { // endpoint для отправки данных о температуре
+      float temp_copy_variable;
+      if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100))) {
+        temp_copy_variable = temperature;
+        xSemaphoreGive(sensor_mutex);
+      }
+      request -> send(200, "text/plain", String(temperature)); //temperature
+    });
 
-void writeFile(fs::FS &fs, const char* path, String data) {
-  File file = fs.open(path, FILE_APPEND);
-  if (!file) {
-    return;
-  }
-  file.seek(file.size());
-  file.print(data);
-  file.close();
-}
+    server.on("/hum", HTTP_GET, [](AsyncWebServerRequest* request) { // endpoint для отправки данных о влажности
+      float hum_copy_variable;
+      if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100))) {
+        hum_copy_variable = humidity;
+        xSemaphoreGive(sensor_mutex);
+      }
+      request -> send(200, "text/plain", String(humidity));
+    });
 
-void startServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request -> send_P(200, "text/html", index_html);
-  });
-
-  server.on("/hum", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request -> send(200, "text/plain", String(humidity));
-  });
-
-  server.on("/temp", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request -> send(200, "text/plain", String(temperature));
-  });
-
-  server.on("/setWiFi", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request -> hasParam("ssid") && request -> hasParam("pass")) {
-
-      String ssidUserWifi = request -> getParam("ssid") -> value();
-      String passwordUserWifi = request -> getParam("pass") -> value();
+    server.on("/get_settings", HTTP_POST, 
+      [](AsyncWebServerRequest* request) {}, 
+      NULL,
+      [](AsyncWebServerRequest* request, uint8_t* data_part, size_t len_part, size_t index_start_part, size_t total_size) {
       
-      preferences.putString("ssid_user", ssidUserWifi);
-      preferences.putString("password_user", passwordUserWifi);
-      preferences.end();
+        String* json_object = new String();
+        json_object -> reserve(total_size);
 
-      request -> send(200, "text/plain", "ok");
-      return;
+        for (size_t i = 0; i < len_part; i++) {
+          json_object -> concat((char)data_part[i]);
+        }
+
+        DynamicJsonDocument document(2048);
+        DeserializationError deserialize_document = deserializeJson(document, *json_object);
+      
+        if (deserialize_document) {
+          Serial.println("JSON error");
+          return;
+        }
+
+        JsonObject root = document.as<JsonObject>();
+        int interval = atoi(root["interval"] | "2"); // -> получение интервала из JSON объекта
+        preferences.putInt("interval_modbus", interval);
+
+        // google
+        JsonObject google = root["google"]; // -> получение JSON объекта google(все его данные)
+        bool flag_google = google["flag-google"] | false;
+        preferences.putBool("flag_google", flag_google);
+
+        String ssid = google["wifi-ssid"] | "nothing";
+        preferences.putString("ssid_wifi", ssid);
+
+        String password = google["wifi-pass"] | "nothing";
+        preferences.putString("password_wifi", password);
+
+        String url_google_sheet = google["url-gs"] | "nothing";
+        preferences.putString("url_google", url_google_sheet);
+
+        String secret_key = google["secret-key"] | "nothing";
+        preferences.putString("secret_key", secret_key);
+
+        int interval_write_google = atoi(google["interval-write"] | "2");
+        preferences.putInt("interval_google", interval_write_google);
+
+        // excel
+        JsonObject excel = root["excel"]; // -> получение JSON объекта excel
+        bool excel_flag = excel["flag-excel"] | false;
+        preferences.putBool("flag_excel", excel_flag);
+
+        int interval_write_excel = atoi(excel["interval-write"] | "2");
+        preferences.putInt("interval_excel", interval_write_excel);
+
+        // file system
+        JsonObject file_system = root["file-system"]; // -> получение JSON объекта file system
+        bool flag_file_system = file_system["flag-fs"] | false;
+        preferences.putBool("flag_file_system", flag_file_system);
+
+        int interval_write_file_system = atoi(file_system["interval-write"] | "2");
+        preferences.putInt("interval_file_system", interval_write_file_system);
+
+        String file_name = file_system["file-name"] | "log.txt";
+        preferences.putString("file_name", file_name);
+
+        request -> send(200, "text/plain", "ok");
+        ESP.restart();
+    });
+
+    server.on("/getDate", HTTP_GET, [](AsyncWebServerRequest* request) {
+      if (request -> hasParam("day") &&
+        request -> hasParam("month") &&
+        request -> hasParam("year") &&
+        request -> hasParam("hour") &&
+        request -> hasParam("min") &&
+        request -> hasParam("sec")) {
+          if (xSemaphoreTake(time_mutex, pdMS_TO_TICKS(100))) {
+            day = request -> getParam("day") -> value().toInt();
+            month = request -> getParam("month") -> value().toInt();
+            year = request -> getParam("year") -> value().toInt();
+
+            hour = request -> getParam("hour") -> value().toInt();
+            minutes = request -> getParam("min") -> value().toInt();
+            sec = request -> getParam("sec") -> value().toInt();
+            rtc.setTime(sec, minutes, (hour - 1), day, month, year); // -> синхронизация времени с модулем rtc
+
+            xSemaphoreGive(time_mutex); 
+          }
+          request -> send(200, "text/plain", "ok");
+          return;
+        } 
+        request -> send(400, "text/plain", "error");
+    });
+
+    server.on("/getFile", HTTP_GET, [](AsyncWebServerRequest* request) {
+      String file_name = preferences.getString("file_name", "log.txt"); // -> файл приходит без /
+      String path = file_name.startsWith("/") ? file_name : "/" + file_name; // -> добавление / для файловой системы LittleFS
+
+      AsyncWebServerResponse* response = request -> beginResponse(LittleFS, path, "text/plain");
+      String response_name_file = file_name;
+
+      if (response_name_file.startsWith("/")) {
+        response_name_file = response_name_file.substring(1); 
+      }  
+    
+      response -> addHeader("Content-Disposition", "attachment; filename=\"" + response_name_file + "\"");
+      request -> send(response);
+    });
+
+    server.begin();
+  }
+
+  void server_task_function(void* parameter) {
+    WiFi.softAP(ssid, password);
+    WiFi.softAPConfig(ip, geteway, subnet);
+    start_server();
+
+    for (;;) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    request -> send(400, "text/plain", "error");
-  });
-
-  server.on("/getDate", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request -> hasParam("day") &&
-    request -> hasParam("month") &&
-    request -> hasParam("year") &&
-    request -> hasParam("sec") &&
-    request -> hasParam("min") &&
-    request -> hasParam("hour")) {
-      day = request -> getParam("day") -> value().toInt();
-      month = request -> getParam("month") -> value().toInt();
-      year = request -> getParam("year") -> value().toInt();
-      seconds = request -> getParam("sec") -> value().toInt();
-      minutes = request -> getParam("min") -> value().toInt();
-      hours = request -> getParam("hour") -> value().toInt();
-
-      rtc.setTime(seconds, minutes, (hours-1), day, month, year);
-      get_date = rtc.getDate() + "\n";
-      get_time = rtc.getTime();
-      writeFile(LittleFS, "/date_sensor.txt", get_date);
-
-      request -> send(200, "text/plain", "ok");
-      return;
-    }
-    request -> send(400, "text/plain", "error");
-  });
-
-  server.on("/getFile", HTTP_GET, [](AsyncWebServerRequest* request) {
-    AsyncWebServerResponse* response = request -> beginResponse(LittleFS, "/data_sensor.txt", "text/plain");
-    response -> addHeader("Content-Disposition", "attachment; filename=\"data_sensor.txt\"");
-    request -> send(response);
-  });
-  server.begin();
-}
-
-void preTransmission() {
-  digitalWrite(MY_PIN, HIGH);
-}
-
-void postTransmission() {
-  digitalWrite(MY_PIN, LOW);
-}
-
-void IRAM_ATTR onTimer() {
-  flag = true;
-}
-
-void IRAM_ATTR onTimerWifi() {
-  flagConnectWifi = true;
-}
-
-void IRAM_ATTR changeDisplay() {
-  bool touch = digitalRead(PIN_SENSOR);
-  if (touch) {
-    countTouchChoiceDisplay++;
   }
-}
+// -> работа сервера
 
-void startModbus() {
-  Serial1.begin(4800, SERIAL_8N1, RX_PIN, TX_PIN);
-  node.begin(1, Serial1);
-  node.preTransmission(preTransmission);
-  node.postTransmission(postTransmission);
-}
+// -> display
+  static lv_disp_draw_buf_t draw_buf;
+  static lv_color_t buf[LCD_WIDTH * LCD_HEIGHT / 10];
 
-void printDisplay(int sizeText, String text, int xPosition, int yPosition) {
-  display.setTextColor(WHITE);
-  display.setTextSize(sizeText);
-  display.setCursor(xPosition, yPosition);
-  display.print(text);
-}
+  lv_obj_t* time_label_value;
+  lv_obj_t* date_label_value;
 
-void timerStart() {
-  timer = timerBegin(1000000);
-  timerAttachInterrupt(timer, &onTimer);
-  timerAlarm(timer, 2000000, true, 0);
-  timerStart(timer);
-}
+  Arduino_DataBus* bus = new Arduino_ESP32QSPI(
+    LCD_CS,
+    LCD_SCLK,
+    LCD_SDIO0,
+    LCD_SDIO1,
+    LCD_SDIO2,
+    LCD_SDIO3
+  );
 
-void timerConnectWifiStart() {
-  timer_wifi_connect = timerBegin(1000000);
-  timerAttachInterrupt(timer_wifi_connect, &onTimerWifi);
-  timerAlarm(timer_wifi_connect, 1800000000, true, 0); // -> каждые полчаса
-  timerStart(timer_wifi_connect);
-}
+  Arduino_SH8601* gfx = new Arduino_SH8601(
+    bus, 
+    GFX_NOT_DEFINED,
+    0,
+    LCD_WIDTH,
+    LCD_HEIGHT
+  );
 
-bool getConnectWifi() {
-  String ssid_user = preferences.getString("ssid_user", "None");
-  String password_user = preferences.getString("password_user", "None");
+  std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus = 
+    std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
 
-  if (ssid_user == "None" && password_user == "None") {
-    return false;
+
+  void Arduino_IIC_Touch_Interrupt(void);
+
+  std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(
+    IIC_Bus,
+    FT3168_DEVICE_ADDRESS,
+    DRIVEBUS_DEFAULT_VALUE,
+    TP_INT,
+    Arduino_IIC_Touch_Interrupt
+  ));
+
+  void Arduino_IIC_Touch_Interrupt(void) {
+    FT3168 -> IIC_Interrupt_Flag = true;
   }
 
-  Serial.print("Ssid: ");
-  Serial.println(ssid_user);
-  Serial.print("Password: ");
-  Serial.println(password_user);
+  void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+    uint32_t width = (area -> x2 - area -> x1 + 1);
+    uint32_t height = (area -> y2 - area -> y1 + 1);
 
-  WiFi.begin(ssid_user, password_user);
-  for (int i = 0; i < 10; i++) {
-    if (WiFi.status() == WL_CONNECTED) {
-      return true;
-    }
-    delay(1000);
-  }
-  return false;
-}
-
-// был тип bool
-// bool connectWiFi(String ssid, String password) {
-//   display.clearDisplay();
-//   printDisplay(1, "Connect to wifi", 0, 10);
-//   display.display();
-
-//   WiFi.begin(ssid, password);
-//   for (int i = 0; i < 30; i++) {
-//     if (WiFi.status() == WL_CONNECTED) {
-//       return true;
-//     }
-//     delay(1000);
-//   }
-//   return false;
-// }
-
-void getDataNtp(const char* url, long gmtOffset, long daylightOffset) {
-  configTime(gmtOffset, daylightOffset, url);
-  struct tm timeinfo;
-
-  if (!getLocalTime(&timeinfo)) {
-    return;
+    gfx -> draw16bitBeRGBBitmap(area -> x1, area -> y1, (uint16_t*)color_p, width, height);
+    lv_disp_flush_ready(disp);
   }
 
-  rtc.setTime(timeinfo.tm_sec,
-  timeinfo.tm_min,
-  (timeinfo.tm_hour - 1),
-  timeinfo.tm_mday,
-  (timeinfo.tm_mon + 1), 
-  (timeinfo.tm_year + 1900));
-}
+  void my_touch_read(lv_indev_drv_t* indev_driver, lv_indev_data_t* data) {
+    uint32_t touch_X = FT3168 -> IIC_Read_Device_Value(FT3168 -> Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    uint32_t touch_Y = FT3168 -> IIC_Read_Device_Value(FT3168 -> Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
 
-// void checkWifi() {
-//   bool connect = connectWiFi(ssidUserWifi, passwordUserWifi);
-//   if (connect) {
-//     Serial.println("Подключение есть!"); // -> нужно будет убрать!
-//     getDataNtp("pool.ntp.org", 18000, 0);
-//   } else {
-//     String ssidWiFi = "Torex";
-//     String passwordWiFi = "123Torex";
-//     startWiFiAp(ssidWiFi, passwordWiFi);
+    if (FT3168 -> IIC_Interrupt_Flag == true) {
+      FT3168 -> IIC_Interrupt_Flag = false;
+      data -> state = LV_INDEV_STATE_PR;
 
-//     display.clearDisplay();
-//     String infoDisplay = "You sure connected wifi: " + ssidWiFi + 
-//     " password: " + passwordWiFi + ". Localhost: 192.168.2.1";
-//     printDisplay(1, infoDisplay, 0, 10);
-//     display.display(); 
-//     // delay(30000);
-//   }
-//   startServer();
-// }
-
-bool postToGoogle(float temp, float hum, const char* info = "") {
-    // client.setInsecure();
-    HTTPClient http;
-    http.begin(url);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Accept", "application/json");
-
-    DynamicJsonDocument doc(512);
-    doc["key"] = secretKey;
-    doc["temperature"] = temp;
-    doc["humidity"] = hum;
-    doc["info"] = info;
-
-    String payload;
-    serializeJson(doc, payload);
-
-    int httpResponseCode = http.POST(payload);
-    if (httpResponseCode > 0) {
-      String resopnse = http.getString();
-      http.end();
-      return resopnse.indexOf("\"result\":\"ok\"") != -1;
+      data -> point.x = touch_X;
+      data -> point.y = touch_Y;
     } else {
-      http.end();
-      return false;
+      data -> state = LV_INDEV_STATE_REL;
     }
-}
-
-// выключение системы
-void stopSystem() {
-  if (timer != NULL && time_wifi_connect != NULL) {
-    timerStop(timer);
-    timerStop(timer_wifi_connect);
-    timerDetachInterrupt(timer);
-    timerDetachInterrupt(timer_wifi_connect);
-    timerEnd(timer);
-    timerEnd(timere_wifi_connect);
-    timer = nullptr;
-    timer_wifi_connect = nullptr;
   }
-  Serial1.end();
-  server.end();
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  LittleFS.end();
-  display.clearDisplay();
-  display.display();
-  display.ssd1306_command(SSD1306_DISPLAYOFF);
-}
 
-// перевод esp32 в сонный режим
-void stopEspWork() {
-  stopSystem();
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_ON_SENSOR, 0);
-  esp_deep_sleep_start();
-}
-
-// включение системы
-void startSystem() {
-  display.ssd1306_command(SSD1306_DISPLAYON);
-  LittleFS.begin();
-  // checkWifi(); // -> change
-  startModbus();
-  timerStart();
-  timerConnectWifiStart();
-}
-
-void applySystemState() {
-  if (systemEnabled) {
-    startSystem();
-  } else {
-    stopEspWork();
+  void create_label(lv_obj_t* scr, const char* text, int position_X, int position_Y) {
+    lv_obj_t* label = lv_label_create(scr);
+    lv_label_set_text(label, text);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, position_X, position_Y);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_22, 0);
   }
-}
+
+  void create_svipe(lv_obj_t* scr) {
+    lv_obj_t* tileview = lv_tileview_create(scr);
+
+    lv_obj_t* title_1 = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_HOR);
+    lv_obj_t* title_2 = lv_tileview_add_tile(tileview, 1, 0, LV_DIR_HOR);
+    lv_obj_t* title_3 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_HOR);
+
+    create_label(title_1, "Sensor humidity-temperature", 22, 50);
+    create_label(title_1, "indications", 120, 70);
+    create_label(title_1, "Humidity:", 22, 150);
+    create_label(title_1, "Temperature:", 22, 250);
+    
+    create_label(title_2, "Time and Date", 105, 50);
+    create_label(title_2, "Time:", 22, 150);
+    time_label_value = lv_label_create(title_2);
+    lv_label_set_text(time_label_value, "--:--:--");
+    lv_obj_align(time_label_value, LV_ALIGN_TOP_LEFT, 100, 150);
+    lv_obj_set_style_text_font(time_label_value, &lv_font_montserrat_22, 0);
+
+    create_label(title_2, "Date:", 22, 250);
+    date_label_value = lv_label_create(title_2);
+    lv_label_set_text(date_label_value, "--:--:--");
+    lv_obj_align(date_label_value, LV_ALIGN_TOP_LEFT, 100, 250);
+    lv_obj_set_style_text_font(date_label_value, &lv_font_montserrat_22, 0);
+
+    create_label(title_3, "Settings", 130, 50);
+  }
+
+  // -> обновление данных о времени 
+  void update_display_time() {
+    char time_str[9]; // -> 8 символов + конец строки "\0" => 9 символов на время
+    char date_str[11]; // -> 10 символов + конец строки => 11 символов
+
+    if (xSemaphoreTake(time_mutex, pdMS_TO_TICKS(100))) {
+      snprintf(
+        time_str, sizeof(time_str), "%02d:%02d:%02d", 
+        rtc.getHour(), rtc.getMinute(), rtc.getSecond()
+      );
+
+      snprintf(
+        date_str, sizeof(date_str), "%02d.%02d.%04d",
+        rtc.getDay(), rtc.getMonth() + 1, rtc.getYear()
+      );
+      xSemaphoreGive(time_mutex);
+    }
+
+    lv_label_set_text(time_label_value, time_str);
+    lv_label_set_text(date_label_value, date_str);
+  }
+// -> display
+
+// -> файловая система
+  TaskHandle_t task_fs;
+
+  hw_timer_t* timer_file_system = NULL;
+  volatile bool flag_write_to_file_system = false;
+
+  void IRAM_ATTR change_flag_fs() {
+    flag_write_to_file_system = true;
+  }
+
+  void start_timer_fs() {
+    timer_file_system = timerBegin(1000000);
+    timerAttachInterrupt(timer_file_system, &change_flag_fs);
+    timerAlarm(timer_file_system, 2000000, true, 0);
+    timerStart(timer_file_system);
+  }
+
+  void writeFile(fs::FS &fs, String path, String data) { // -> запись в файл
+    File file = fs.open(path, FILE_APPEND);
+    if (!file) {
+      return;
+    }
+    file.seek(file.size());
+    file.print(data);
+    file.close();
+  }
+
+  // -> надо записывать общие данные о температуре и времени в файл
+  void fs_task_function(void* parameter) {
+    LittleFS.begin();
+    start_timer_fs();
+    
+    String path_file = preferences.getString("file_name", "log.txt");
+    if (path_file.startsWith("/")) {
+      path_file = "/" + path_file;
+    }
+
+    for (;;) {
+      if (flag_write_to_file_system) {
+        flag_write_to_file_system = false;
+
+        float copy_temp_variable;
+        float copy_hum_variable;
+
+        String copy_rtc_time;
+        String copy_rtc_date;
+
+        if (xSemaphoreTake(time_mutex, pdMS_TO_TICKS(100))) {
+          if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100))) {
+            // -> в mutax нельзя записывать данные в файловую систему!
+            // -> в mutax нельзя выводить данные в Serial монитор!
+            // -> в mutax нельзя запускать веб-сервер!
+            
+            // -> Можно только читать/записывать данные в общие переменные(операции не должны быть сложными) 
+
+            copy_temp_variable = temperature;
+            copy_hum_variable = humidity;
+
+            copy_rtc_time = String(rtc.getTime());
+            copy_rtc_date = String(rtc.getDate());
+
+            xSemaphoreGive(sensor_mutex);
+          }
+          xSemaphoreGive(time_mutex);
+        }
+        String result_time_date = copy_rtc_time + copy_rtc_date + "\n";
+        String result_sensor = String(copy_temp_variable) + String(copy_hum_variable) + "\n\n";
+
+        writeFile(LittleFS, path_file, result_time_date);
+        writeFile(LittleFS, path_file, result_sensor);
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+// -> файловая система
+
+// -> запись в google-таблицы
+  TaskHandle_t google_task;
+
+  hw_timer_t* timer_google_sheet = NULL;
+  volatile bool flag_write_to_google = false;
+
+  // TODO -> сделать запрос на google-таблицы
+  // TODO -> сделать обработку запроса
+
+  void IRAM_ATTR change_google_flag() {
+    flag_write_to_google = true;
+  }
+
+  void start_timer_google() {
+    timer_google_sheet = timerBegin(1000000);
+    timerAttachInterrupt(timer_google_sheet, &change_google_flag);
+    timerAlarm(timer_google_sheet, 2000000, true, 0);
+    timerStart(timer_google_sheet);
+  }
+
+  void google_task(void* parameter) {
+    start_timer_sheet();
+    for(;;) {
+      // -> по прерыванию отправлять данные в google-таблицы
+    }
+  }
+// -> запись в google-таблицы
+
+// -> запись в excel
+// -> запись в excel
 
 void setup() {
-  Serial.begin(9600);
-  delay(1000);
+  USBSerial.begin(115200);
+  preferences.begin("interval", false);
+  Wire.begin(IIC_SDA, IIC_SCL);
 
-  WiFi.softAPConfig(ip, getaway, subnet);
-  WiFi.softAP("Torex", "Torex123");
-  // WiFi.begin(WIFI_AP);
+  sensor_mutex = xSemaphoreCreateMutex();
+  time_mutex = xSemaphoreCreateMutex();
 
-  pinMode(PIN_ON_SENSOR, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_ON_SENSOR), onWork, FALLING);
+  pinMode(TRANS_PIN, OUTPUT);
+  digitalWrite(TRANS_PIN, LOW);
 
-  pinMode(MY_PIN, OUTPUT);
-  digitalWrite(MY_PIN, LOW);
+  // -> задача связанная с modbus
+  xTaskCreatePinnedToCore(
+    modbus_task_function,
+    "ModbusTask",
+    10000,
+    NULL,
+    1, // -> приоритет задачи
+    &task_modbus,
+    0 // -> ядро
+  );
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    for (; ;);
+  // -> задача связанная с сервером
+  xTaskCreatePinnedToCore(
+    server_task_function,
+    "ServerTask",
+    10000,
+    NULL,
+    1,
+    &task_server,
+    0
+  );
+
+  // -> задача файловой системы
+  xTaskCreatePinnedToCore(
+    fs_task_function,
+    "FileSystemTask",
+    10000,
+    NULL,
+    1,
+    &task_fs,
+    0
+  );
+// TODO -> сделать задачу для google/data_streamer потоков
+  USBSerial.print("Ядро задействовано: ");
+  USBSerial.println(xPortGetCoreID());
+  
+  gfx -> begin();
+  gfx -> setBrightness(204);
+
+  while (FT3168 -> begin() == false) {
+    delay(2000);
   }
-  display.clearDisplay();
 
-  // if (!LittleFS.begin(FORMAT_LITTLEFS_IS_FAILED)) {
-  //   return;
-  // }
+  FT3168 -> IIC_Write_Device_State(
+    FT3168 -> Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
+    FT3168 -> Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR
+  );
 
-  // -> инициализация пространства имен
-  preferences.begin("user_wifi_data", false);
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, LCD_WIDTH * LCD_HEIGHT / 10);
 
-  LittleFS.begin();
+  static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = LCD_WIDTH;
+    disp_drv.ver_res = LCD_HEIGHT;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
 
-  // checkWifi(); // -> инициализация один раз за проект
-  startModbus();
-  timerStart();
-  timerConnectWifiStart();
+  static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touch_read;
+    lv_indev_drv_register(&indev_drv);
 
-  attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), changeDisplay, RISING);
-  startServer();
-}
-
-void printDataStreamer(float humidity, float temp) {
-  Serial.print("Humidity: ");
-  Serial.print(",");
-  Serial.print(humidity);
-  Serial.print(",");
-  Serial.print("Temperature: ");
-  Serial.print(",");
-  Serial.println(temp);
+  lv_obj_t* scr = lv_scr_act();
+  create_svipe(scr);
 }
 
 void loop() {
-  
-  if (systemEnabled != lastSystemState) {
-    lastSystemState = systemEnabled;
-    applySystemState();
-  }
-
-  if (!systemEnabled) {
-    delay(200);
-    return;
-  }
-  
-  if (flagConnectWifi) {
-    flagConnectWifi = false;
-    bool connect = getConnectWifi();
-    if (connect) {
-      Serial.println("Есть подключение!");
-    }
-  }
-
-  if (flag) {
-    flag = false;
-
-    uint8_t result;
-    uint16_t dataModbus[2];
-    result = node.readInputRegisters(0x0000, 2);
-    if (result == node.ku8MBSuccess) {
-      dataModbus[0] = node.getResponseBuffer(0x00);
-      dataModbus[1] = node.getResponseBuffer(0x01);
-
-      humidity = dataModbus[0] / 10.0;
-      temperature = dataModbus[1] / 10.0;
-
-      String results = " Humidity: " + String(humidity) + "\t" + "Temperature: " + String(temperature) + "\n\n";
-      String timer = rtc.getTime() + "\t";
-      writeFile(LittleFS, "/data_sensor.txt", timer);
-      writeFile(LittleFS, "/data_sensor.txt", results);
-      printDataStreamer(humidity, temperature);
-
-      postToGoogle(temperature, humidity, "sensor_get");
-    }
-  }
-
-  if (countTouchChoiceDisplay % 2 != 0) {
-    display.clearDisplay();
-    printDisplay(1, "Temperature:", 0, 30);
-    printDisplay(1, "Humidity:", 0, 50);
-    printDisplay(1, String(temperature), 80, 30);
-    printDisplay(1, String(humidity), 60, 50);
-    display.display();
-  } else {
-    display.clearDisplay();
-    printDisplay(1, rtc.getDate(), 0, 30);
-    printDisplay(1, rtc.getTime(), 0, 50);
-    display.display();
-  }
+  // put your main code here, to run repeatedly:
+  lv_tick_inc(5);
+  lv_timer_handler();
+  update_display_time();
+  delay(5);
 }
