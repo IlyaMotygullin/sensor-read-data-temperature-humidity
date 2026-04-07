@@ -60,7 +60,6 @@ ESP32Time rtc(3600);
   lv_disp_draw_buf_t draw_buf;
   lv_color_t* disp_draw_buf;
   lv_disp_drv_t disp_drv;
-  // lv_obj_t* scr = lv_scr_act();
 
   lv_obj_t* temperature_label_value;
   lv_obj_t* humidity_label_value;
@@ -72,76 +71,27 @@ ESP32Time rtc(3600);
   uint32_t screen_height;
   uint32_t buf_size;
 
-  lv_indev_t* indev_keypad;
   volatile bool button_pressed_flag = false; // -> флаг для определения нажатия кнопки
   volatile bool button_is_pressed = false;
   bool current_screen_flag = true; // -> флаг для отрисовки определенного сигнала
 
   // lv_obj_t *key_obj;
-  enum Screen_Mode { // -> два экрана 
-    SENSOR_DATA_VALUE_SCREEN, // -> показания с датчика
-    DATE_VALUE_SCREEN, // -> экран времени
-    SETTINGS_SCREEN // -> экран настроек
+  enum Mode_ESP { // -> режимы работы esp32: настройки и показания
+    MODE_VIEW_SENSOR_AND_TIME,
+    MODE_VIEW_SETTINGS
   };
-  Screen_Mode current_mode = SENSOR_DATA_VALUE_SCREEN; 
+  Mode_ESP mode_esp = MODE_VIEW_SENSOR_AND_TIME;
 
-  // -> TODO: нужно сделать определение нажатия кнопки(длительное нажатие или короткое)
-  /*
-    при длительном нажатии нужно переходить на настройки экрана,
-    иными словами, нужно сделать "два дисплея".
+  enum Screen_Sensor_Time_Date { // -> экраны показаний и времени для режима работы MODE_VIEW_SENSOR_AND_TIME
+    SCREEN_SENSOR_VALUE,
+    SCREEN_DATE_TIME_VALUE
+  };
+  Screen_Sensor_Time_Date screen_sensor_time_date = SCREEN_SENSOR_VALUE;
 
-    настройки экрана:
-      управление яркостью дисплея
-      информация об адресе локального хоста
-      информация об отключении самой платы
-
-    нужно научиться определять тип нажатия:
-      Простое нажатие - событие LV_EVENT_PRESSED
-      Удержание кнопки - событие LV_EVENT_PRESSING
-      Удержание кнопки по времени - событие LV_EVENT_LONG_PRESSED
-  */
-
-  static void keypad_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data) { // -> привязка физической кнопки к lvgl
-    static bool is_pressed = false;
-    
-    static uint32_t last_key = 0; // -> последний код клавиши для lvgl
-    static uint32_t last_hw_key = 0; // -> последний код физической кнопки
-
-    uint32_t act_key = bsp_button_read(); // -> получение текущего кода кнопки
-    uint32_t lvgl_key = 0; // -> текущий код клавиши для lvgl
-
-    if (act_key != 0 && last_hw_key == 0) { // -> обработка только коротких нажатий
-      button_pressed_flag = true;
-    }
-    
-    if (act_key != 0) {
-      data -> state = LV_INDEV_STATE_PR;
-      switch (act_key) {
-        case 1:
-          lvgl_key = LV_KEY_LEFT;
-          break;
-        case 2:
-          lvgl_key = LV_KEY_RIGHT;
-          break;
-      }
-
-      if (lvgl_key != 0) {
-        last_key = lvgl_key;      
-      }
-    } else {
-      data -> state = LV_INDEV_STATE_REL;
-    }
-    data -> key = last_key;
-    last_hw_key = act_key;
-  } 
-
-  void my_disp_flush(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p) {
-    // lv_disp_flush_ready(disp_drv);
-    uint32_t width = area -> x2 - area -> x1 + 1;
-    uint32_t height = area -> y2 - area -> y1 + 1;
-    gfx -> draw16bitRGBBitmap(area->x1, area->y1, (uint16_t*)color_p, width, height);
-    lv_disp_flush_ready(disp_drv);
-  }
+  enum Screen_Settings { // -> экраны настроек для режима работы MODE_VIEW_SETTINGS
+    SCREEN_INFO
+  };
+  Screen_Settings current_screen_settings = SCREEN_INFO;
 
   void create_label(lv_obj_t* scr, const char* text, int position_x, int position_y) {
     lv_obj_t* label = lv_label_create(scr);
@@ -200,7 +150,6 @@ ESP32Time rtc(3600);
     lv_obj_t* scr = lv_scr_act();
     lv_obj_clean(scr);
     create_label(scr, "Sensor humidity/temperature", 40, 10);
-    // create_panel(lv_obj_t* scr, const char* position, int x_position, int y_position, int width, int height)
     create_panel(scr, "Left", "Blue", 2, -2, 159, 185); // -> синий
     create_panel(scr, "Right", "Red", -2, -2, 159, 185); // -> красный
   }
@@ -226,10 +175,7 @@ ESP32Time rtc(3600);
       xSemaphoreGive(time_mutex);
     }
   }
-  /*
-    lv_obj_t* time_label_value;
-    lv_obj_t* date_label_value;
-  */
+
   void screen_date() {
     lv_obj_t* scr = lv_scr_act();
     lv_obj_clean(scr);
@@ -251,7 +197,49 @@ ESP32Time rtc(3600);
   void screen_settings() {
     lv_obj_t* scr = lv_scr_act();
     lv_obj_clean(scr);
-    create_label(scr, "Settings", 80, 10);
+    create_label(scr, "Settings", 120, 10);
+  }
+
+  void process_button_event() {
+    uint32_t event = bsp_button_read();
+
+    if (event == 0) {
+      return;
+    }
+
+    if (event == 1) {
+      if (mode_esp == MODE_VIEW_SENSOR_AND_TIME) {
+        if (screen_sensor_time_date == SCREEN_SENSOR_VALUE) {
+          screen_sensor_time_date = SCREEN_DATE_TIME_VALUE;
+          screen_date();
+        } else {
+          screen_sensor_time_date = SCREEN_SENSOR_VALUE;
+          screen_sensor();
+        }
+      } else if (mode_esp == MODE_VIEW_SETTINGS) {
+        screen_settings();
+      }
+    } else if (event == 2) {
+      if (mode_esp == MODE_VIEW_SENSOR_AND_TIME) {
+        mode_esp = MODE_VIEW_SETTINGS;
+        current_screen_settings = SCREEN_INFO;
+        screen_settings();
+      } else {
+        mode_esp = MODE_VIEW_SENSOR_AND_TIME;
+        if (screen_sensor_time_date == SCREEN_SENSOR_VALUE) {
+          screen_sensor();
+        } else {
+          screen_date();
+        }
+      }
+    }
+  }
+
+  void my_disp_flush(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p) {
+    uint32_t width = area -> x2 - area -> x1 + 1;
+    uint32_t height = area -> y2 - area -> y1 + 1;
+    gfx -> draw16bitRGBBitmap(area->x1, area->y1, (uint16_t*)color_p, width, height);
+    lv_disp_flush_ready(disp_drv);
   }
 // -> disp
 
@@ -1349,12 +1337,6 @@ void setup() {
       disp_drv.draw_buf = &draw_buf;
       disp_drv.direct_mode = false;
       lv_disp_drv_register(&disp_drv);
-
-      static lv_indev_drv_t indev_drv;
-      lv_indev_drv_init(&indev_drv);
-      indev_drv.type = LV_INDEV_TYPE_KEYPAD;
-      indev_drv.read_cb = keypad_read_cb;
-      indev_keypad = lv_indev_drv_register(&indev_drv);
     }
     screen_sensor();
   // -> disp_setup
@@ -1377,20 +1359,15 @@ void loop() {
   lv_tick_inc(5);
   lv_timer_handler();
 
-  if (button_pressed_flag) {
-    button_pressed_flag = false;
-    current_screen_flag = !current_screen_flag;
-    if (current_screen_flag) {
-      screen_sensor();
-    } else {
-      screen_date();
+  process_button_event();
+
+  if (mode_esp == MODE_VIEW_SENSOR_AND_TIME) {
+    if (screen_sensor_time_date == SCREEN_SENSOR_VALUE) {
+      update_sensor_display();
+    } else if (screen_sensor_time_date == SCREEN_DATE_TIME_VALUE) {
+      update_time_display();
     }
   }
 
-  if (current_screen_flag) { // -> состояние для одного экрана - экран показаний и времени
-    update_sensor_display();
-  } else {
-    update_time_display();
-  }
   delay(10);
 }
